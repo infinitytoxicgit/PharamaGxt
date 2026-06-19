@@ -1004,6 +1004,7 @@ async def callback_router(client, cq: CallbackQuery):
 
     # ── ADMIN PANEL ──
     if data.startswith("admin|"):
+        global QUEUE_PAUSED
         if cq.from_user.id not in ADMIN_IDS:
             return await cq.answer("❌ Unauthorized", show_alert=True)
         cmd = data.split("|")[1]
@@ -1028,7 +1029,6 @@ async def callback_router(client, cq: CallbackQuery):
             await cq.message.edit_text(text, reply_markup=kb)
 
         elif cmd == "toggle_queue":
-            global QUEUE_PAUSED
             QUEUE_PAUSED = not QUEUE_PAUSED
             state = "PAUSED ⏸️" if QUEUE_PAUSED else "ACTIVE ▶️"
             await cq.answer(f"Queue is now {state}", show_alert=True)
