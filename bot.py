@@ -1564,7 +1564,7 @@ async def main():
     print("LOOP MAIN:", id(asyncio.get_running_loop()))
     print("LOOP APP :", id(app.loop))
     print("LOOP DSP :", id(app.dispatcher.loop))
-    # await start_services()
+    await start_services()
     print("🚀 Pharma Ultimate Bot v4.0 Scale-Ready Engine starting…")
     try:
         await app.start()
