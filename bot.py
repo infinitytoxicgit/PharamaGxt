@@ -6,12 +6,7 @@ from collections import OrderedDict
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, quote_plus, unquote
 from functools import wraps
-from typing import List, Dict, Optional
-
-try:
-    import pypdf
-except ImportError:
-    pypdf = None
+from typing import List, Dict, Optional, Any, Tuple
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -27,61 +22,405 @@ import redis.asyncio as aioredis
 import structlog
 
 # ─────────────────────────────────────────────
-#  LOGGING & NODE IDENTIFICATION
+#  LOGGING
 # ─────────────────────────────────────────────
 NODE_ID = os.getenv("NODE_ID", uuid.uuid4().hex[:8])
 
 structlog.configure(
     processors=[
         structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S"),
-        structlog.processors.JSONRenderer()
+        structlog.processors.JSONRenderer(),
     ],
-    logger_factory=structlog.PrintLoggerFactory()
+    logger_factory=structlog.PrintLoggerFactory(),
 )
 log = structlog.get_logger().bind(node=NODE_ID)
 
 # ─────────────────────────────────────────────
-#  ENV CONFIG & PROXIES
+#  ENV CONFIG
 # ─────────────────────────────────────────────
 _RAW_API_ID = os.getenv("API_ID", "0")
-API_ID    = int(_RAW_API_ID) if str(_RAW_API_ID).strip().isdigit() else 0
+API_ID    = int(_RAW_API_ID) if _RAW_API_ID.strip().isdigit() else 0
 API_HASH  = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/pharma_bot")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") if x.strip().isdigit()]
 ALLOWED_USERS = [int(x) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.strip().isdigit()]
-PROXIES = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]  # BUG FIX 1: strip whitespace from proxy strings
+PROXIES = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]
 
 GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY", "")
-GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX", "")
+GOOGLE_SEARCH_CX      = os.getenv("GOOGLE_SEARCH_CX", "")
 
 # ─────────────────────────────────────────────
-#  ASYNCIO EVENT LOOP — MUST BE CREATED FIRST
-#  BUG FIX 2: Semaphores, Locks, Queues MUST be
-#  created inside an async context OR after loop
-#  is running. Creating them at module-level with
-#  Python 3.10+ raises DeprecationWarning and can
-#  bind to the wrong loop. We defer init to startup.
+#  USER AGENTS
 # ─────────────────────────────────────────────
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+]
+
+def random_ua() -> str:
+    """Always returns a fresh random UA — called per-request, not at startup."""
+    return random.choice(USER_AGENTS)
 
 # ─────────────────────────────────────────────
-#  PROXY TRACKING STATE
+#  SSRF-SAFE DNS RESOLVER — FIX #1
+#
+#  Original bug: subclassed aiohttp.ThreadedResolver
+#  and made resolve() async — ThreadedResolver is
+#  internally sync and aiohttp does NOT call async
+#  resolve(). This caused silent DNS bypass or crash.
+#
+#  Fix: implement aiohttp.AbstractResolver properly.
+#  resolve() is async in AbstractResolver and we do
+#  the blocking getaddrinfo in a thread via
+#  asyncio.to_thread() with a hard timeout.
 # ─────────────────────────────────────────────
-PROXY_FAILS: Dict[str, int] = {p: 0 for p in PROXIES}
-PROXY_SUCCESS: Dict[str, int] = {p: 0 for p in PROXIES}
-PROXY_LATENCY: Dict[str, float] = {p: 5.0 for p in PROXIES}
-DEAD_PROXIES: set = set()
-PROXY_REVIVE_COUNTS: Dict[str, int] = {p: 0 for p in PROXIES}
-ABSOLUTE_DEAD_PROXIES: set = set()
+_PRIVATE_PREFIXES = (
+    "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.",
+    "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.",
+    "172.27.", "172.28.", "172.29.", "172.30.", "172.31.", "192.168.",
+)
+_PRIVATE_EXACT = {"127.0.0.1", "0.0.0.0", "::1", "localhost"}
+
+def _ip_is_safe(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return not (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_multicast or ip.is_unspecified)
+    except ValueError:
+        return False
+
+def _host_is_safe(host: str) -> bool:
+    h = host.lower().split(":")[0].strip("[]")
+    if h in _PRIVATE_EXACT:
+        return False
+    if any(h.startswith(p) for p in _PRIVATE_PREFIXES):
+        return False
+    return True
+
+class SSRFSafeResolver(aiohttp.AbstractResolver):
+    """
+    Correct implementation of aiohttp.AbstractResolver.
+    - async resolve() as required by aiohttp internals
+    - DNS lookup in thread with timeout to prevent hang
+    - Blocks private/loopback IPs at resolution time
+    """
+
+    async def resolve(
+        self, host: str, port: int = 0, family: int = socket.AF_INET
+    ) -> List[Dict]:
+        if not _host_is_safe(host):
+            raise aiohttp.ClientConnectorError(
+                connection_key=None,  # type: ignore[arg-type]
+                os_error=OSError(f"SSRF: blocked host {host!r}"),
+            )
+        try:
+            infos = await asyncio.wait_for(
+                asyncio.to_thread(
+                    socket.getaddrinfo, host, port,
+                    family, socket.SOCK_STREAM
+                ),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            raise aiohttp.ClientConnectorError(
+                connection_key=None,  # type: ignore[arg-type]
+                os_error=OSError(f"DNS timeout for {host!r}"),
+            )
+
+        results = []
+        for af, kind, proto, canonname, sockaddr in infos:
+            ip = sockaddr[0]
+            if not _ip_is_safe(ip):
+                raise aiohttp.ClientConnectorError(
+                    connection_key=None,  # type: ignore[arg-type]
+                    os_error=OSError(f"SSRF: {host!r} resolved to private IP {ip}"),
+                )
+            results.append({
+                "hostname": host,
+                "host":     ip,
+                "port":     sockaddr[1],
+                "family":   af,
+                "proto":    proto,
+                "flags":    0,
+            })
+        if not results:
+            raise aiohttp.ClientConnectorError(
+                connection_key=None,  # type: ignore[arg-type]
+                os_error=OSError(f"No valid addresses for {host!r}"),
+            )
+        return results
+
+    async def close(self) -> None:
+        pass  # nothing to clean up
+
+# ─────────────────────────────────────────────
+#  URL VALIDATORS
+# ─────────────────────────────────────────────
+def valid_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        return p.scheme in ("http", "https") and _host_is_safe(p.hostname or "")
+    except Exception:
+        return False
+
+async def async_valid_url(url: str, dns_cache: Dict, dns_cache_lock: asyncio.Lock) -> bool:
+    """
+    Async URL validator with DNS-level SSRF check and caching.
+    dns_cache + lock passed in (not global) to avoid import-time init issues.
+    """
+    try:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https"):
+            return False
+        host = (p.hostname or "").lower().strip("[]")
+        if not host or not _host_is_safe(host):
+            return False
+
+        async with dns_cache_lock:
+            cached = dns_cache.get(host)
+            if cached and time.time() - cached["ts"] < 3600:
+                return cached["safe"]
+
+        try:
+            infos = await asyncio.wait_for(
+                asyncio.to_thread(socket.getaddrinfo, host, None),
+                timeout=5.0,
+            )
+            safe = all(_ip_is_safe(r[4][0]) for r in infos)
+        except asyncio.TimeoutError:
+            safe = False
+
+        async with dns_cache_lock:
+            dns_cache[host] = {"safe": safe, "ts": time.time()}
+        return safe
+    except Exception:
+        return False
+
+# ─────────────────────────────────────────────
+#  PROXY POOL MANAGER — FIX #2, #7
+# ─────────────────────────────────────────────
 PROXY_BLACKLIST_THRESHOLD = 10
 
-DOMAIN_PROXY_STATS: Dict[str, Dict] = {
-    "google":   {p: {"fails": 0, "success": 0, "latency": 5.0} for p in PROXIES},
-    "bing":     {p: {"fails": 0, "success": 0, "latency": 5.0} for p in PROXIES},
-    "ddg":      {p: {"fails": 0, "success": 0, "latency": 5.0} for p in PROXIES},
-    "telegram": {p: {"fails": 0, "success": 0, "latency": 5.0} for p in PROXIES},
-}
+class ProxyPool:
+    """
+    Thread-safe proxy pool with latency-weighted selection.
+    All edge cases handled:
+      - empty pool → None
+      - all proxies dead → None
+      - zero-weight edge case → uniform fallback
+    """
+
+    def __init__(self, proxies: List[str]):
+        self._lock    = None   # set in async_init()
+        self._proxies = list(proxies)
+        self._fails:    Dict[str, int]   = {p: 0   for p in proxies}
+        self._success:  Dict[str, int]   = {p: 0   for p in proxies}
+        self._latency:  Dict[str, float] = {p: 5.0 for p in proxies}
+        self._dead:     set = set()
+        self._abs_dead: set = set()
+        self._revives:  Dict[str, int] = {p: 0 for p in proxies}
+
+    async def async_init(self):
+        self._lock = asyncio.Lock()
+
+    def _valid(self) -> List[str]:
+        return [
+            p for p in self._proxies
+            if p not in self._dead
+            and p not in self._abs_dead
+            and self._fails.get(p, 0) < PROXY_BLACKLIST_THRESHOLD
+        ]
+
+    async def get(self) -> Optional[str]:
+        if not self._proxies:
+            return None
+        async with self._lock:
+            valid = self._valid()
+            if not valid:
+                log.warning("proxy_pool_exhausted", dead=len(self._dead))
+                return None
+            # FIX #2: zero-division guard + uniform fallback
+            weights = [1.0 / max(self._latency.get(p, 5.0), 0.01) for p in valid]
+            total = sum(weights)
+            if total <= 0:
+                return random.choice(valid)   # uniform fallback
+            probs = [w / total for w in weights]
+            return random.choices(valid, weights=probs, k=1)[0]
+
+    async def success(self, proxy: str, latency: float):
+        async with self._lock:
+            self._success[proxy] = self._success.get(proxy, 0) + 1
+            self._fails[proxy]   = max(0, self._fails.get(proxy, 0) - 1)
+            old = self._latency.get(proxy, latency)
+            self._latency[proxy] = 0.8 * old + 0.2 * latency   # EMA
+            if proxy in self._dead:
+                self._dead.discard(proxy)
+                self._revives[proxy] = self._revives.get(proxy, 0) + 1
+                log.info("proxy_revived", proxy=proxy)
+
+    async def fail(self, proxy: str):
+        async with self._lock:
+            self._fails[proxy] = self._fails.get(proxy, 0) + 1
+            f = self._fails[proxy]
+            if f >= PROXY_BLACKLIST_THRESHOLD:
+                self._dead.add(proxy)
+                log.warning("proxy_marked_dead", proxy=proxy, fails=f)
+            if f >= PROXY_BLACKLIST_THRESHOLD * 3:
+                self._abs_dead.add(proxy)
+                log.error("proxy_permanently_blacklisted", proxy=proxy)
+
+    def stats(self) -> Dict:
+        return {
+            "total":    len(self._proxies),
+            "dead":     len(self._dead),
+            "abs_dead": len(self._abs_dead),
+            "active":   len(self._valid()),
+        }
+
+# ─────────────────────────────────────────────
+#  CIRCUIT BREAKER
+# ─────────────────────────────────────────────
+class CircuitBreaker:
+    TRIP_THRESHOLD = 5
+    RESET_AFTER    = 300  # seconds
+
+    def __init__(self, domains: List[str]):
+        self._fails: Dict[str, int]   = {d: 0   for d in domains}
+        self._state: Dict[str, str]   = {d: "CLOSED" for d in domains}
+        self._trip_at: Dict[str, float] = {d: 0.0 for d in domains}
+
+    def is_open(self, domain: str) -> bool:
+        if self._state.get(domain) == "OPEN":
+            if time.time() > self._trip_at.get(domain, 0):
+                self._state[domain] = "HALF_OPEN"
+                log.info("circuit_half_open", domain=domain)
+                return False
+            return True
+        return False
+
+    def trip(self, domain: str):
+        self._fails[domain] = self._fails.get(domain, 0) + 1
+        if self._fails[domain] > self.TRIP_THRESHOLD:
+            self._state[domain]   = "OPEN"
+            self._trip_at[domain] = time.time() + self.RESET_AFTER
+            self._fails[domain]   = 0
+            log.error("circuit_tripped", domain=domain, reset_in=self.RESET_AFTER)
+
+    def heal(self, domain: str):
+        self._fails[domain] = 0
+        if self._state.get(domain) in ("OPEN", "HALF_OPEN"):
+            self._state[domain] = "CLOSED"
+            log.info("circuit_healed", domain=domain)
+
+DOMAINS = ["google", "bing", "ddg", "telegram"]
+
+# ─────────────────────────────────────────────
+#  REDIS WRAPPER — FIX #3 (type consistency)
+# ─────────────────────────────────────────────
+class RedisClient:
+    """
+    Thin wrapper ensuring all values are bytes consistently.
+    decode_responses=False always → bytes in, bytes out.
+    No implicit string/bytes confusion anywhere.
+    """
+
+    def __init__(self):
+        self._r: Optional[aioredis.Redis] = None
+        self.disabled = False
+
+    async def connect(self, url: str):
+        try:
+            self._r = await aioredis.from_url(
+                url,
+                encoding="utf-8",
+                decode_responses=False,   # always bytes
+                socket_connect_timeout=5,
+                socket_timeout=5,
+            )
+            await self._r.ping()
+            log.info("redis_connected")
+        except Exception as e:
+            log.warning("redis_unavailable", err=str(e))
+            self._r = None
+            self.disabled = True
+
+    async def get(self, key: str) -> Optional[bytes]:
+        if not self._r:
+            return None
+        try:
+            val = await self._r.get(key)
+            return bytes(val) if val is not None else None
+        except Exception as e:
+            log.warning("redis_get_fail", key=key, err=str(e))
+            return None
+
+    async def set(self, key: str, value: bytes, ttl: int = 7200):
+        if not self._r:
+            return
+        try:
+            await self._r.setex(key, ttl, value)
+        except Exception as e:
+            log.warning("redis_set_fail", key=key, err=str(e))
+
+    async def exists(self, key: str) -> bool:
+        if not self._r:
+            return False
+        try:
+            return bool(await self._r.exists(key))
+        except Exception:
+            return False
+
+    async def rate_limit(self, key: str, ttl: int = 5) -> bool:
+        """Returns True if rate limited (key already exists)."""
+        if not self._r:
+            return False
+        try:
+            # SET NX (only set if not exists) → atomic check+set
+            result = await self._r.set(key, b"1", ex=ttl, nx=True)
+            return result is None  # None = key existed = rate limited
+        except Exception:
+            return False
+
+    async def close(self):
+        if self._r:
+            await self._r.close()
+            self._r = None
+
+# ─────────────────────────────────────────────
+#  DOWNLOAD QUEUE ITEM — FIX #5 (enforce structure)
+# ─────────────────────────────────────────────
+from dataclasses import dataclass
+
+@dataclass
+class DownloadTask:
+    source:  str
+    chat_id: int
+    url:     str
+    title:   str
+    user_id: int
+
+    def to_dict(self) -> Dict:
+        return {
+            "source":  self.source,
+            "chat_id": self.chat_id,
+            "url":     self.url,
+            "title":   self.title,
+            "user_id": self.user_id,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "DownloadTask":
+        return cls(
+            source=d.get("source", "restored"),
+            chat_id=d["chat_id"],
+            url=d["url"],
+            title=d["title"],
+            user_id=d["user_id"],
+        )
 
 # ─────────────────────────────────────────────
 #  CONSTANTS
@@ -105,14 +444,8 @@ EXAM_TREE = {
             "ESIC Kolkata", "ESIC Hyderabad", "ESIC Bengaluru",
         ],
     },
-    "DSSSB": {
-        "label": "🏛️ DSSSB Pharmacist",
-        "regions": ["DSSSB Delhi"],
-    },
-    "RUHS": {
-        "label": "🎓 RUHS Pharmacist",
-        "regions": ["RUHS Rajasthan"],
-    },
+    "DSSSB":  {"label": "🏛️ DSSSB Pharmacist",  "regions": ["DSSSB Delhi"]},
+    "RUHS":   {"label": "🎓 RUHS Pharmacist",    "regions": ["RUHS Rajasthan"]},
     "NHM": {
         "label": "🌿 NHM Pharmacist",
         "regions": [
@@ -128,10 +461,7 @@ EXAM_TREE = {
             "Drug Inspector Delhi", "Drug Inspector Maharashtra", "Drug Inspector Gujarat",
         ],
     },
-    "GPAT": {
-        "label": "📚 GPAT / NIPER",
-        "regions": ["GPAT All India"],
-    },
+    "GPAT":       {"label": "📚 GPAT / NIPER",       "regions": ["GPAT All India"]},
     "STATE_PHARMA": {
         "label": "🗺️ State PSC Pharmacist",
         "regions": [
@@ -157,350 +487,292 @@ TELEGRAM_CHANNELS = [
     "pharmacist_exam_zone", "pharma_study_hub",
 ]
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-]
-
-# BUG FIX 3: REGION_ID_MAP size guard was using wrong eviction —
-# `next(iter(OrderedDict))` on a plain dict has no order guarantee in older
-# Pythons. Use OrderedDict explicitly or popitem(last=False).
 REGION_ID_MAP: OrderedDict = OrderedDict()
 
 def get_region_hash(region_str: str) -> str:
     rh = hashlib.md5(region_str.encode()).hexdigest()[:8]
     REGION_ID_MAP[rh] = region_str
     if len(REGION_ID_MAP) > 1000:
-        REGION_ID_MAP.popitem(last=False)  # BUG FIX 3: guaranteed FIFO eviction
+        REGION_ID_MAP.popitem(last=False)
     return rh
 
-# ─────────────────────────────────────────────
-#  GLOBAL STATE — primitives only at module level
-#  BUG FIX 2 (continued): asyncio primitives are
-#  created inside init_async_state() below.
-# ─────────────────────────────────────────────
-SESSION:    Optional[aiohttp.ClientSession] = None
-REDIS:      Optional[aioredis.Redis]        = None
-MONGO_DB                                    = None
+def make_search_id(exam_key: str, region: str, year: int, mat: str) -> str:
+    return hashlib.sha256(f"{exam_key}|{region}|{year}|{mat}".encode()).hexdigest()[:24]
 
-# Declared here, assigned in init_async_state()
-STATE_LOCK:        asyncio.Lock
-SQLITE_LOCK:       asyncio.Lock
-DNS_CACHE_LOCK:    asyncio.Lock
-CACHE_LOCK:        asyncio.Lock
-ACTIVE_DL_LOCK:    asyncio.Lock
-DOWNLOAD_QUEUE:    asyncio.Queue
-DOWNLOAD_SEMAPHORE: asyncio.Semaphore
-SCRAPE_SEMAPHORE:   asyncio.Semaphore
-DOMAIN_LIMITS:      Dict[str, asyncio.Semaphore]
-
-DNS_CACHE: Dict[str, Dict] = {}
-DNS_CACHE_TTL = 3600
-USER_DL_TIMESTAMPS: Dict[int, float] = {}
-
-DOMAIN_PENALTY = {"google": 0.0, "bing": 0.0, "ddg": 0.0, "telegram": 0.0}
-DOMAIN_CIRCUIT_BREAKER = {"google": 0, "bing": 0, "ddg": 0, "telegram": 0}
-CIRCUIT_TRIP_TIME = {"google": 0.0, "bing": 0.0, "ddg": 0.0, "telegram": 0.0}
-CIRCUIT_STATE = {"google": "CLOSED", "bing": "CLOSED", "ddg": "CLOSED", "telegram": "CLOSED"}
-
-ACTIVE_DL      = 0
-BURST_WORKERS  = 0
-MAX_BURST_WORKERS = 10
-MAX_TOTAL_WORKERS = 15
-BURST_TASKS: set = set()
-
-LAST_BURST_TIME = 0.0
-BURST_COOLDOWN = 30.0
-
-LOCAL_MEM_CACHE: Dict[str, Dict] = {}
-
-TASK_REGISTRY: Dict[str, set] = {
-    "static_workers": set(),
-    "burst_workers":  set(),
-    "background_loops": set()
-}
-
-BOT_METRICS: Dict = {
-    "total_searches": 0,
-    "pdfs_downloaded": 0,
-    "bytes_downloaded": 0,
-    "api_fallback_hits": 0,
-    "engine_errors": {
-        "google": 0, "bing": 0, "ddg": 0, "telegram": 0
-    }
-}
-MONGO_SYNCED_SIDS: set = set()
-
-DOWNLOAD_LATENCY_EMA = 0.0
-EVENT_LOOP_LAG       = 0.0
-
-QUEUE_PAUSED   = False
-BOT_START_TIME = time.time()
-LAST_BAN_CLEAR_TIME = time.time()
-
-SESSION_MAP: OrderedDict = OrderedDict()
-SESSION_EXPIRY: Dict[str, float] = {}
-SESSION_LAST_ACCESSED: Dict[str, float] = {}
-SESSION_TTL = 3600
-REDIS_DISABLED_WARNING = False
-
-GLOBAL_BANS: set = set()
-USER_VIOLATIONS: Dict[int, int] = {}
-USER_DL_COUNTS: Dict[int, int] = {}
-USER_DAILY_QUOTA: Dict[int, int] = {}
+def make_search_id_v2(exam_key: str, region: str, year: int, mat: str, user_id=None) -> str:
+    return hashlib.sha256(f"{exam_key}|{region}|{year}|{mat}|{user_id or 0}".encode()).hexdigest()[:24]
 
 # ─────────────────────────────────────────────
-#  ASYNC STATE INITIALIZER
-#  BUG FIX 2: All asyncio primitives created here,
-#  called from main() AFTER the event loop starts.
+#  COMPRESSION
 # ─────────────────────────────────────────────
-async def init_async_state():
-    global STATE_LOCK, SQLITE_LOCK, DNS_CACHE_LOCK, CACHE_LOCK, ACTIVE_DL_LOCK
-    global DOWNLOAD_QUEUE, DOWNLOAD_SEMAPHORE, SCRAPE_SEMAPHORE, DOMAIN_LIMITS
+def compress(data: Any) -> bytes:
+    return zlib.compress(json.dumps(data, ensure_ascii=False).encode("utf-8"), level=6)
 
-    STATE_LOCK      = asyncio.Lock()
-    SQLITE_LOCK     = asyncio.Lock()
-    DNS_CACHE_LOCK  = asyncio.Lock()
-    CACHE_LOCK      = asyncio.Lock()
-    ACTIVE_DL_LOCK  = asyncio.Lock()
-
-    DOWNLOAD_QUEUE      = asyncio.Queue(maxsize=1000)
-    DOWNLOAD_SEMAPHORE  = asyncio.Semaphore(5)
-    SCRAPE_SEMAPHORE    = asyncio.Semaphore(8)
-    DOMAIN_LIMITS       = {
-        "google":   asyncio.Semaphore(2),
-        "bing":     asyncio.Semaphore(3),
-        "ddg":      asyncio.Semaphore(4),
-        "telegram": asyncio.Semaphore(3),
-    }
-    log.info("async_state_initialized")
-
-# ─────────────────────────────────────────────
-#  CIRCUIT BREAKER
-# ─────────────────────────────────────────────
-def is_circuit_open(domain: str) -> bool:
-    if CIRCUIT_STATE[domain] == "OPEN":
-        if time.time() > CIRCUIT_TRIP_TIME.get(domain, 0):
-            CIRCUIT_STATE[domain] = "HALF_OPEN"
-            log.info("circuit_half_open_testing_recovery", domain=domain)
-            return False
-        return True
-    return False
-
-def trip_circuit(domain: str):
-    DOMAIN_CIRCUIT_BREAKER[domain] += 1
-    if DOMAIN_CIRCUIT_BREAKER[domain] > 5:
-        CIRCUIT_STATE[domain] = "OPEN"
-        CIRCUIT_TRIP_TIME[domain] = time.time() + 300
-        log.error("circuit_breaker_tripped_open", domain=domain, penalty_seconds=300)
-        DOMAIN_CIRCUIT_BREAKER[domain] = 0
-
-def heal_circuit(domain: str):
-    DOMAIN_CIRCUIT_BREAKER[domain] = 0
-    if CIRCUIT_STATE[domain] in ["OPEN", "HALF_OPEN"]:
-        CIRCUIT_STATE[domain] = "CLOSED"
-        log.info("circuit_fully_healed_closed", domain=domain)
+def decompress(b: bytes) -> Any:
+    return json.loads(zlib.decompress(b).decode("utf-8"))
 
 # ─────────────────────────────────────────────
 #  SQLITE SUBSYSTEM
 # ─────────────────────────────────────────────
 SQLITE_DB_PATH = "sessions_spillover.db"
 
-async def init_sqlite_spillover():
-    async with SQLITE_LOCK:
-        try:
-            async with aiosqlite.connect(SQLITE_DB_PATH) as db:
-                await db.execute("""
-                    CREATE TABLE IF NOT EXISTS spillover
-                    (sid TEXT PRIMARY KEY, data BLOB, ts REAL)
-                """)
-                await db.execute("""
-                    CREATE TABLE IF NOT EXISTS persistent_metrics
-                    (id TEXT PRIMARY KEY, data TEXT)
-                """)
-                # BUG FIX 4: Enable WAL mode for concurrent read/write
+class SQLiteStore:
+    """Async SQLite with WAL mode and a single shared lock."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock: Optional[asyncio.Lock] = None
+
+    async def async_init(self):
+        self._lock = asyncio.Lock()
+        async with self._lock:
+            async with aiosqlite.connect(self.path) as db:
                 await db.execute("PRAGMA journal_mode=WAL")
-                await db.commit()
-        except Exception as e:
-            log.error("sqlite_init_fail", err=str(e))
-
-async def sqlite_save(sid: str, data: bytes):
-    async with SQLITE_LOCK:
-        try:
-            async with aiosqlite.connect(SQLITE_DB_PATH) as db:
                 await db.execute(
-                    "REPLACE INTO spillover (sid, data, ts) VALUES (?, ?, ?)",
-                    (sid, data, time.time())
+                    "CREATE TABLE IF NOT EXISTS spillover "
+                    "(sid TEXT PRIMARY KEY, data BLOB, ts REAL)"
+                )
+                await db.execute(
+                    "CREATE TABLE IF NOT EXISTS persistent_metrics "
+                    "(id TEXT PRIMARY KEY, data TEXT)"
                 )
                 await db.commit()
-        except Exception as e:
-            log.error("sqlite_spillover_save_fail", err=str(e)[:60])
+        log.info("sqlite_initialized", path=self.path)
 
-async def sqlite_load(sid: str) -> Optional[bytes]:
-    async with SQLITE_LOCK:
-        try:
-            async with aiosqlite.connect(SQLITE_DB_PATH) as db:
-                async with db.execute(
-                    "SELECT data FROM spillover WHERE sid=?", (sid,)
-                ) as cursor:
-                    row = await cursor.fetchone()
-                    # BUG FIX 5: row[0] might be memoryview from aiosqlite BLOB;
-                    # must convert to bytes explicitly.
-                    return bytes(row[0]) if row else None
-        except Exception:
-            return None
-
-async def save_persistent_metrics():
-    payload = {
-        "BOT_METRICS":     BOT_METRICS,
-        "USER_DAILY_QUOTA": USER_DAILY_QUOTA,
-        "USER_DL_COUNTS":  USER_DL_COUNTS,
-    }
-    async with SQLITE_LOCK:
-        try:
-            async with aiosqlite.connect(SQLITE_DB_PATH) as db:
-                await db.execute(
-                    "REPLACE INTO persistent_metrics (id, data) VALUES (?, ?)",
-                    ("bot_metrics_v2", json.dumps(payload))
-                )
-                await db.commit()
-        except Exception as e:
-            log.error("save_persistent_metrics_fail", err=str(e))  # BUG FIX 6: was silently passing
-
-async def load_persistent_metrics():
-    async with SQLITE_LOCK:
-        try:
-            async with aiosqlite.connect(SQLITE_DB_PATH) as db:
-                async with db.execute(
-                    "SELECT data FROM persistent_metrics WHERE id=?",
-                    ("bot_metrics_v2",)
-                ) as cursor:
-                    row = await cursor.fetchone()
-                    if row:
-                        loaded = json.loads(row[0])
-                        BOT_METRICS.update(loaded.get("BOT_METRICS", {}))
-                        USER_DAILY_QUOTA.update(loaded.get("USER_DAILY_QUOTA", {}))
-                        USER_DL_COUNTS.update(loaded.get("USER_DL_COUNTS", {}))
-        except Exception as e:
-            log.error("load_persistent_metrics_fail", err=str(e))  # BUG FIX 6: was silently passing
-
-# ─────────────────────────────────────────────
-#  TASK ORCHESTRATION & QUEUE PERSISTENCE
-# ─────────────────────────────────────────────
-def log_task_exception(task: asyncio.Task):
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        log.error("background_task_crashed_silently", task_name=task.get_name(), err=str(e))
-
-def create_safe_task(coro, name: str) -> asyncio.Task:
-    task = asyncio.create_task(coro, name=name)
-    task.add_done_callback(log_task_exception)
-    return task
-
-def dump_local_queue():
-    items = []
-    while not DOWNLOAD_QUEUE.empty():
-        try:
-            item = DOWNLOAD_QUEUE.get_nowait()
-            # BUG FIX 7: original checked len==5 but queue items may have
-            # variable structure. Check minimum required fields safely.
-            if isinstance(item, tuple) and len(item) >= 5:
-                items.append({
-                    "chat_id": item[1],
-                    "url":     item[2],
-                    "title":   item[3],
-                    "user_id": item[4],
-                })
-            DOWNLOAD_QUEUE.task_done()
-        except asyncio.QueueEmpty:
-            break
-        except Exception:
-            pass
-    if items:
-        try:
-            with open("local_queue_backup.json", "w") as f:
-                json.dump(items, f)
-            log.info("local_queue_saved_to_disk", count=len(items))
-        except Exception as e:
-            log.error("dump_local_queue_fail", err=str(e))
-
-def load_local_queue():
-    if os.path.exists("local_queue_backup.json"):
-        try:
-            with open("local_queue_backup.json", "r") as f:
-                items = json.load(f)
-            loaded = 0
-            for item in items:
-                try:
-                    DOWNLOAD_QUEUE.put_nowait((
-                        "restored_app",
-                        item["chat_id"],
-                        item["url"],
-                        item["title"],
-                        item["user_id"],
-                    ))
-                    loaded += 1
-                except asyncio.QueueFull:
-                    log.warning(
-                        "local_queue_full_during_restore",
-                        loaded=loaded,
-                        dropped=len(items) - loaded,  # BUG FIX 8: was wrong count
+    async def save_session(self, sid: str, data: bytes):
+        async with self._lock:
+            try:
+                async with aiosqlite.connect(self.path) as db:
+                    await db.execute(
+                        "REPLACE INTO spillover (sid, data, ts) VALUES (?, ?, ?)",
+                        (sid, data, time.time()),
                     )
-                    break
-            os.remove("local_queue_backup.json")
-            log.info("local_queue_restored_from_disk", count=loaded)
-        except Exception as e:
-            log.error("load_local_queue_fail", err=str(e))
+                    await db.commit()
+            except Exception as e:
+                log.error("sqlite_save_fail", err=str(e))
+
+    async def load_session(self, sid: str) -> Optional[bytes]:
+        async with self._lock:
+            try:
+                async with aiosqlite.connect(self.path) as db:
+                    async with db.execute(
+                        "SELECT data FROM spillover WHERE sid=?", (sid,)
+                    ) as cur:
+                        row = await cur.fetchone()
+                        # FIX #5 (BLOB): aiosqlite returns memoryview for BLOB
+                        return bytes(row[0]) if row else None
+            except Exception as e:
+                log.error("sqlite_load_fail", err=str(e))
+                return None
+
+    async def save_metrics(self, payload: Dict):
+        async with self._lock:
+            try:
+                async with aiosqlite.connect(self.path) as db:
+                    await db.execute(
+                        "REPLACE INTO persistent_metrics (id, data) VALUES (?, ?)",
+                        ("bot_metrics_v3", json.dumps(payload)),
+                    )
+                    await db.commit()
+            except Exception as e:
+                log.error("sqlite_metrics_save_fail", err=str(e))
+
+    async def load_metrics(self) -> Optional[Dict]:
+        async with self._lock:
+            try:
+                async with aiosqlite.connect(self.path) as db:
+                    async with db.execute(
+                        "SELECT data FROM persistent_metrics WHERE id=?",
+                        ("bot_metrics_v3",),
+                    ) as cur:
+                        row = await cur.fetchone()
+                        return json.loads(row[0]) if row else None
+            except Exception as e:
+                log.error("sqlite_metrics_load_fail", err=str(e))
+                return None
+
+# ─────────────────────────────────────────────
+#  BOT STATE — single container, no module-level
+#  asyncio primitives.  FIX #8
+# ─────────────────────────────────────────────
+class BotState:
+    """
+    All mutable bot state lives here.
+    Instantiated inside main() after event loop starts.
+    No asyncio primitive is created at import time.
+    """
+
+    def __init__(self):
+        # Async primitives — set in async_init()
+        self.state_lock:     asyncio.Lock
+        self.cache_lock:     asyncio.Lock
+        self.active_dl_lock: asyncio.Lock
+        self.download_queue: asyncio.Queue
+        self.dl_semaphore:   asyncio.Semaphore
+        self.scrape_semaphore: asyncio.Semaphore
+        self.domain_limits:  Dict[str, asyncio.Semaphore]
+
+        # Sync state
+        self.global_bans:    set = set()
+        self.user_violations: Dict[int, int] = {}
+        self.user_dl_counts:  Dict[int, int] = {}
+        self.user_daily_quota: Dict[int, int] = {}
+        self.user_dl_ts:      Dict[int, float] = {}
+
+        self.local_mem_cache: Dict[str, Any] = {}
+
+        self.session_map:     OrderedDict = OrderedDict()
+        self.session_expiry:  Dict[str, float] = {}
+        self.session_last_accessed: Dict[str, float] = {}
+        self.session_ttl = 3600
+
+        self.active_dl    = 0
+        self.burst_workers = 0
+        self.burst_tasks:  set = set()
+        self.last_burst_time = 0.0
+        self.burst_cooldown  = 30.0
+
+        self.queue_paused   = False
+        self.start_time     = time.time()
+        self.last_ban_clear = time.time()
+
+        self.metrics: Dict = {
+            "total_searches":  0,
+            "pdfs_downloaded": 0,
+            "bytes_downloaded": 0,
+            "api_fallback_hits": 0,
+            "engine_errors": {d: 0 for d in DOMAINS},
+        }
+        self.mongo_synced_sids: set = set()
+        self.dl_latency_ema   = 0.0
+        self.event_loop_lag   = 0.0
+
+        # Task registry
+        self.task_registry: Dict[str, set] = {
+            "static_workers":   set(),
+            "burst_workers":    set(),
+            "background_loops": set(),
+        }
+
+    async def async_init(self):
+        """Called inside running event loop."""
+        self.state_lock      = asyncio.Lock()
+        self.cache_lock      = asyncio.Lock()
+        self.active_dl_lock  = asyncio.Lock()
+        self.download_queue  = asyncio.Queue(maxsize=1000)
+        self.dl_semaphore    = asyncio.Semaphore(5)
+        self.scrape_semaphore = asyncio.Semaphore(8)
+        self.domain_limits   = {
+            "google":   asyncio.Semaphore(2),
+            "bing":     asyncio.Semaphore(3),
+            "ddg":      asyncio.Semaphore(4),
+            "telegram": asyncio.Semaphore(3),
+        }
+        log.info("bot_state_async_init_done")
+
+    # ── ban helpers ──────────────────────────
+    async def is_banned(self, user_id: int) -> bool:
+        async with self.state_lock:
+            return user_id in self.global_bans
+
+    async def record_violation(self, user_id: int):
+        async with self.state_lock:
+            self.user_violations[user_id] = self.user_violations.get(user_id, 0) + 1
+            if self.user_violations[user_id] > 15:
+                self.global_bans.add(user_id)
+                log.warning("global_ban_applied", user_id=user_id)
+
+    # ── queue helpers ────────────────────────
+    def dump_queue(self) -> List[Dict]:
+        items = []
+        while True:
+            try:
+                task = self.download_queue.get_nowait()
+                if isinstance(task, DownloadTask):
+                    items.append(task.to_dict())
+                # task_done only for items we actually consumed
+                self.download_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+            except Exception:
+                break
+        return items
+
+    async def restore_queue(self, items: List[Dict]):
+        loaded = 0
+        for d in items:
+            try:
+                task = DownloadTask.from_dict(d)
+                self.download_queue.put_nowait(task)
+                loaded += 1
+            except asyncio.QueueFull:
+                log.warning("queue_full_on_restore", loaded=loaded, dropped=len(items) - loaded)
+                break
+            except Exception as e:
+                log.warning("queue_restore_item_fail", err=str(e))
+        log.info("queue_restored", count=loaded)
+
+# ─────────────────────────────────────────────
+#  GLOBAL SINGLETONS — created in main()
+# ─────────────────────────────────────────────
+state:    BotState
+proxy_pool: ProxyPool
+circuit:    CircuitBreaker
+redis_client: RedisClient
+sqlite_store: SQLiteStore
+SESSION:  Optional[aiohttp.ClientSession] = None
+MONGO_DB: Any = None
 
 # ─────────────────────────────────────────────
 #  PYROGRAM CLIENT
 # ─────────────────────────────────────────────
 app = Client(
-    "pharma_ultimate_v2",
+    "pharma_ultimate_v3",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
 )
 
 # ─────────────────────────────────────────────
-#  SAFE HANDLER DECORATOR
-#  BUG FIX 9: `tid` was created but never used in
-#  the FloodWait retry — error trace lost on retry.
-#  Also: unauthorized check must handle None from_user
-#  (channel posts have no from_user).
+#  SAFE HANDLER DECORATOR — FIX #9
+#
+#  FIX: channel posts have from_user=None → guard
+#  FIX: None user_id with empty ALLOWED_USERS list
+#       must NOT silently pass (could allow anon)
 # ─────────────────────────────────────────────
 def safe(func):
     @wraps(func)
     async def wrapper(*args, **kwargs):
-        user_id = None
+        user_id: Optional[int] = None
         for a in args:
-            if isinstance(a, Message):
-                # BUG FIX 9a: from_user is None for channel/anonymous messages
-                user_id = a.from_user.id if a.from_user else None
+            if isinstance(a, Message) and a.from_user:
+                user_id = a.from_user.id
                 break
-            elif isinstance(a, CallbackQuery):
-                user_id = a.from_user.id if a.from_user else None
+            elif isinstance(a, CallbackQuery) and a.from_user:
+                user_id = a.from_user.id
                 break
 
-        if ALLOWED_USERS and user_id and user_id not in ALLOWED_USERS and user_id not in ADMIN_IDS:
-            log.warning("unauthorized_access_attempt", user_id=user_id)
+        # FIX #9: if user_id is None (channel/anon) AND we have an allowlist,
+        # block it — anonymous posts should not bypass access control.
+        if ALLOWED_USERS:
+            if user_id is None or (user_id not in ALLOWED_USERS and user_id not in ADMIN_IDS):
+                log.warning("access_denied", user_id=user_id)
+                return
+
+        # Rate-limit / ban check (no lock held across await)
+        if user_id and await state.is_banned(user_id):
             return
 
         tid = uuid.uuid4().hex[:8]
         try:
             return await func(*args, **kwargs)
         except FloodWait as fw:
-            log.warning("flood_wait", fn=func.__name__, seconds=fw.value, tid=tid)
+            log.warning("flood_wait", fn=func.__name__, secs=fw.value, tid=tid)
             await asyncio.sleep(fw.value + 1)
             try:
                 return await func(*args, **kwargs)
             except Exception as e:
-                log.error("handler_crash_after_flood_retry", fn=func.__name__, err=str(e), tid=tid)
+                log.error("retry_after_flood_fail", fn=func.__name__, err=str(e), tid=tid)
         except MessageNotModified:
             pass
         except Exception as e:
@@ -508,333 +780,246 @@ def safe(func):
             for a in args:
                 if isinstance(a, Message):
                     try:
-                        await a.reply_text(f"❌ Error. Trace: `{tid}`")
+                        await a.reply_text(f"❌ Error — Trace: `{tid}`")
                     except Exception:
                         pass
                     break
                 elif isinstance(a, CallbackQuery):
                     try:
-                        await a.answer(f"⚠️ Error. Trace: {tid}", show_alert=True)
+                        await a.answer(f"⚠️ Error — Trace: {tid}", show_alert=True)
                     except Exception:
                         pass
                     break
     return wrapper
 
 # ─────────────────────────────────────────────
-#  REDIS HELPERS & GLOBAL BANS
-#  BUG FIX 10: is_rate_limited used STATE_LOCK
-#  then immediately called REDIS (which itself
-#  may acquire locks). Holding STATE_LOCK across
-#  an await on REDIS is a deadlock risk.
-#  Fixed by releasing STATE_LOCK before Redis ops.
+#  RATE LIMITER — FIX #10 (no lock across await)
 # ─────────────────────────────────────────────
 async def is_rate_limited(user_id: int, prefix: str, ttl: int = 5) -> bool:
-    # Check ban first — short critical section
-    async with STATE_LOCK:
-        is_banned = user_id in GLOBAL_BANS
-
-    if is_banned:
+    if await state.is_banned(user_id):
         return True
-
-    if not REDIS:
-        return False
-
     key = f"rl:{prefix}:{user_id}"
-    try:
-        hit = await REDIS.get(key)
-    except Exception:
-        return False  # BUG FIX 10a: Redis error → don't block user
+    limited = await redis_client.rate_limit(key, ttl)
+    if limited:
+        await state.record_violation(user_id)
+    return limited
 
-    if hit:
-        async with STATE_LOCK:  # BUG FIX 10: STATE_LOCK NOT held across await
-            USER_VIOLATIONS[user_id] = USER_VIOLATIONS.get(user_id, 0) + 1
-            if USER_VIOLATIONS[user_id] > 15:
-                GLOBAL_BANS.add(user_id)
-                log.warning("global_ban_applied_to_spammer", user_id=user_id)
-        return True
-
-    try:
-        await REDIS.setex(key, ttl, b"1")
-    except Exception:
-        pass
-    return False
-
-async def redis_get(key: str) -> Optional[bytes]:
-    if not REDIS:
-        return None
-    try:
-        val = await REDIS.get(key)
-        return bytes(val) if val is not None else None  # BUG FIX 11: ensure bytes, not memoryview
-    except Exception:
+# ─────────────────────────────────────────────
+#  HTTP FETCH with per-request UA — FIX #4
+# ─────────────────────────────────────────────
+async def fetch(
+    url: str,
+    *,
+    proxy: Optional[str] = None,
+    timeout: float = 20.0,
+    domain: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Single fetch with:
+    - Per-request random User-Agent (FIX #4)
+    - Proxy success/fail tracking
+    - Circuit breaker integration
+    - SSRF-safe session
+    """
+    if domain and circuit.is_open(domain):
+        log.warning("circuit_open_skip", domain=domain, url=url)
         return None
 
-async def redis_set(key: str, value: bytes, ttl: int = 7200):
-    if not REDIS:
-        return
+    if not valid_url(url):
+        log.warning("invalid_url_blocked", url=url)
+        return None
+
+    t_start = time.monotonic()
     try:
-        await REDIS.setex(key, ttl, value)
+        async with SESSION.get(
+            url,
+            proxy=proxy,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+            headers={"User-Agent": random_ua()},   # FIX #4: per-request UA
+            allow_redirects=True,
+            max_redirects=5,
+        ) as resp:
+            resp.raise_for_status()
+            text = await resp.text(errors="replace")
+
+        latency = time.monotonic() - t_start
+        if proxy:
+            await proxy_pool.success(proxy, latency)
+        if domain:
+            circuit.heal(domain)
+        return text
+
+    except aiohttp.ClientResponseError as e:
+        log.warning("fetch_http_error", url=url, status=e.status)
+        if proxy:
+            await proxy_pool.fail(proxy)
+        if domain:
+            circuit.trip(domain)
+        return None
     except Exception as e:
-        log.warning("redis_set_fail", key=key, err=str(e))  # BUG FIX 12: was silently passing
-
-# ─────────────────────────────────────────────
-#  COMPRESSION HELPERS
-#  BUG FIX 13: decompress() returned list but
-#  callers may pass data that serialized as dict.
-#  Return Any and let callers cast.
-# ─────────────────────────────────────────────
-def compress(data) -> bytes:
-    return zlib.compress(json.dumps(data, ensure_ascii=False).encode("utf-8"), level=6)
-
-def decompress(b: bytes):
-    return json.loads(zlib.decompress(b).decode("utf-8"))
-
-def normalize_bytes(x) -> Optional[bytes]:
-    if x is None:
+        log.warning("fetch_error", url=url, err=str(e)[:80])
+        if proxy:
+            await proxy_pool.fail(proxy)
+        if domain:
+            circuit.trip(domain)
         return None
-    return bytes(x)
 
 # ─────────────────────────────────────────────
-#  SEARCH ID & CACHE KEYS
-# ─────────────────────────────────────────────
-def make_search_id(exam_key: str, region: str, year: int, mat: str) -> str:
-    raw = f"{exam_key}|{region}|{year}|{mat}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:24]
-
-def make_search_id_v2(exam_key: str, region: str, year: int, mat: str, user_id=None) -> str:
-    raw = f"{exam_key}|{region}|{year}|{mat}|{user_id or 0}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:24]
-
-# ─────────────────────────────────────────────
-#  SSRF-SAFE DNS RESOLVER
-# ─────────────────────────────────────────────
-_PRIVATE_PREFIXES = (
-    "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.",
-    "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.",
-    "172.27.", "172.28.", "172.29.", "172.30.", "172.31.", "192.168.",
-)
-_PRIVATE_EXACT = {"127.0.0.1", "0.0.0.0", "::1", "localhost"}
-
-def _host_is_safe(host: str) -> bool:
-    h = host.lower().split(":")[0].strip("[]")
-    if h in _PRIVATE_EXACT:
-        return False
-    if any(h.startswith(p) for p in _PRIVATE_PREFIXES):
-        return False
-    return True
-
-async def async_valid_url(url: str) -> bool:
-    try:
-        p = urlparse(url)
-        if p.scheme not in ("http", "https"):
-            return False
-
-        clean_host = (p.hostname or "").lower().strip("[]")
-        if not clean_host:
-            return False
-
-        # BUG FIX 14: original called safe_host(p.hostname) which returns bool,
-        # then called safe_host again inside. Consolidated here.
-        if not _host_is_safe(clean_host):
-            return False
-
-        async with DNS_CACHE_LOCK:
-            cached = DNS_CACHE.get(clean_host)
-            if cached and time.time() - cached["ts"] < DNS_CACHE_TTL:
-                return cached["safe"]
-
-        try:
-            addr_info = await asyncio.wait_for(
-                asyncio.to_thread(socket.getaddrinfo, clean_host, None),
-                timeout=5.0  # BUG FIX 15: DNS lookup had no timeout — could block forever
-            )
-        except asyncio.TimeoutError:
-            log.warning("dns_lookup_timeout", host=clean_host)
-            return False
-
-        is_safe = all(
-            not (ipaddress.ip_address(res[4][0]).is_private or
-                 ipaddress.ip_address(res[4][0]).is_loopback)
-            for res in addr_info
-        )
-
-        async with DNS_CACHE_LOCK:
-            DNS_CACHE[clean_host] = {"safe": is_safe, "ts": time.time()}
-
-        return is_safe
-    except Exception:
-        return False
-
-def safe_host(host: str) -> bool:
-    clean_host = (host or "").split(":")[0].strip("[]")
-    return _host_is_safe(clean_host)
-
-def valid_url(url: str) -> bool:
-    try:
-        p = urlparse(url)
-        return p.scheme in ("http", "https") and safe_host(p.hostname or "")
-    except Exception:
-        return False
-
-class SSRFSenseResolver(aiohttp.ThreadedResolver):
-    async def resolve(self, host, port=0, family=socket.AF_INET):
-        ips = await super().resolve(host, port, family)
-        for ip in ips:
-            ip_obj = ipaddress.ip_address(ip["host"])
-            if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local:
-                raise ValueError(f"SSRF Blocked at DNS level: {host} -> {ip['host']}")
-        return ips
-
-# ─────────────────────────────────────────────
-#  PROXY SELECTOR
-# ─────────────────────────────────────────────
-async def get_random_proxy() -> Optional[str]:
-    async with STATE_LOCK:
-        if not PROXIES:
-            return None
-        valid_proxies = [
-            p for p in PROXIES
-            if p not in DEAD_PROXIES
-            and p not in ABSOLUTE_DEAD_PROXIES
-            and PROXY_FAILS.get(p, 0) < PROXY_BLACKLIST_THRESHOLD
-        ]
-        if not valid_proxies:
-            log.warning("all_proxies_dead_or_failed", dead=len(DEAD_PROXIES))
-            # BUG FIX 16: original code cut off here with no return →
-            # function fell through returning None implicitly (OK) but
-            # the condition `< PROXY_BLACKLIST_THRESHOLD` was missing from
-            # the truncated original. Restored properly.
-            return None
-
-        # Weighted selection: lower latency = higher weight
-        weights = [
-            1.0 / max(PROXY_LATENCY.get(p, 5.0), 0.1)
-            for p in valid_proxies
-        ]
-        total = sum(weights)
-        probs = [w / total for w in weights]
-        return random.choices(valid_proxies, weights=probs, k=1)[0]
-
-async def mark_proxy_success(proxy: str, latency: float):
-    async with STATE_LOCK:
-        PROXY_SUCCESS[proxy] = PROXY_SUCCESS.get(proxy, 0) + 1
-        PROXY_FAILS[proxy]   = max(0, PROXY_FAILS.get(proxy, 0) - 1)
-        # Exponential moving average for latency
-        old = PROXY_LATENCY.get(proxy, latency)
-        PROXY_LATENCY[proxy] = 0.8 * old + 0.2 * latency
-        if proxy in DEAD_PROXIES:
-            DEAD_PROXIES.discard(proxy)
-            PROXY_REVIVE_COUNTS[proxy] = PROXY_REVIVE_COUNTS.get(proxy, 0) + 1
-            log.info("proxy_revived", proxy=proxy)
-
-async def mark_proxy_fail(proxy: str):
-    async with STATE_LOCK:
-        PROXY_FAILS[proxy] = PROXY_FAILS.get(proxy, 0) + 1
-        if PROXY_FAILS[proxy] >= PROXY_BLACKLIST_THRESHOLD:
-            DEAD_PROXIES.add(proxy)
-            log.warning("proxy_marked_dead", proxy=proxy, fails=PROXY_FAILS[proxy])
-        if PROXY_FAILS[proxy] >= PROXY_BLACKLIST_THRESHOLD * 3:
-            ABSOLUTE_DEAD_PROXIES.add(proxy)
-            log.error("proxy_permanently_blacklisted", proxy=proxy)
-
-# ─────────────────────────────────────────────
-#  SESSION / CONNECTION POOL INIT
-#  BUG FIX 17: aiohttp.ClientSession must be
-#  created inside a running event loop.
+#  SESSION INIT — FIX #6 (resolver failure safe)
 # ─────────────────────────────────────────────
 async def init_session():
     global SESSION
-    connector = aiohttp.TCPConnector(
-        resolver=SSRFSenseResolver(),
-        ssl=True,
-        limit=100,
-        limit_per_host=10,
-        ttl_dns_cache=300,
-        enable_cleanup_closed=True,
-    )
-    SESSION = aiohttp.ClientSession(
-        connector=connector,
-        timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_read=20),
-        headers={"User-Agent": random.choice(USER_AGENTS)},
-    )
-    log.info("aiohttp_session_created")
+    try:
+        connector = aiohttp.TCPConnector(
+            resolver=SSRFSafeResolver(),   # FIX #1 & #6
+            ssl=True,
+            limit=100,
+            limit_per_host=10,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+        )
+        SESSION = aiohttp.ClientSession(
+            connector=connector,
+            # FIX #4: no static UA header here — set per-request in fetch()
+        )
+        log.info("aiohttp_session_created")
+    except Exception as e:
+        log.error("aiohttp_session_init_fail", err=str(e))
+        # Fallback: session without custom resolver (still functional)
+        SESSION = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+        )
+        log.warning("aiohttp_session_fallback_no_ssrf_resolver")
 
 async def close_session():
     global SESSION
     if SESSION and not SESSION.closed:
         await SESSION.close()
-        SESSION = None
-    log.info("aiohttp_session_closed")
+    SESSION = None
 
 # ─────────────────────────────────────────────
-#  REDIS INIT
-# ─────────────────────────────────────────────
-async def init_redis():
-    global REDIS, REDIS_DISABLED_WARNING
-    try:
-        REDIS = await aioredis.from_url(
-            REDIS_URL,
-            encoding="utf-8",
-            decode_responses=False,
-            socket_connect_timeout=5,
-            socket_timeout=5,
-        )
-        await REDIS.ping()
-        log.info("redis_connected", url=REDIS_URL)
-    except Exception as e:
-        log.warning("redis_unavailable_falling_back_to_local", err=str(e))
-        REDIS = None
-        REDIS_DISABLED_WARNING = True
-
-async def close_redis():
-    global REDIS
-    if REDIS:
-        await REDIS.close()
-        REDIS = None
-
-# ─────────────────────────────────────────────
-#  MONGO INIT
+#  MONGO INIT — FIX #10 (timeout + ping safe)
 # ─────────────────────────────────────────────
 async def init_mongo():
     global MONGO_DB
     try:
-        client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-        await client.admin.command("ping")
+        client = AsyncIOMotorClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            socketTimeoutMS=10000,
+        )
+        # Motor's admin.command is truly async
+        await asyncio.wait_for(
+            client.admin.command("ping"),
+            timeout=6.0,   # FIX #10: explicit outer timeout
+        )
         db_name = urlparse(MONGO_URI).path.lstrip("/") or "pharma_bot"
         MONGO_DB = client[db_name]
         log.info("mongo_connected", db=db_name)
+    except asyncio.TimeoutError:
+        log.warning("mongo_ping_timeout")
+        MONGO_DB = None
     except Exception as e:
         log.warning("mongo_unavailable", err=str(e))
         MONGO_DB = None
 
 # ─────────────────────────────────────────────
+#  QUEUE PERSISTENCE
+# ─────────────────────────────────────────────
+QUEUE_BACKUP_PATH = "local_queue_backup.json"
+
+def dump_queue_sync():
+    """Called at shutdown (sync context)."""
+    items = state.dump_queue()
+    if items:
+        try:
+            with open(QUEUE_BACKUP_PATH, "w") as f:
+                json.dump(items, f)
+            log.info("queue_saved", count=len(items))
+        except Exception as e:
+            log.error("queue_save_fail", err=str(e))
+
+async def restore_queue_async():
+    if not os.path.exists(QUEUE_BACKUP_PATH):
+        return
+    try:
+        with open(QUEUE_BACKUP_PATH, "r") as f:
+            items = json.load(f)
+        await state.restore_queue(items)
+        os.remove(QUEUE_BACKUP_PATH)
+    except Exception as e:
+        log.error("queue_restore_fail", err=str(e))
+
+# ─────────────────────────────────────────────
+#  TASK HELPERS
+# ─────────────────────────────────────────────
+def _log_task_exc(task: asyncio.Task):
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        log.error("task_crashed", name=task.get_name(), err=str(e))
+
+def create_safe_task(coro, name: str) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=name)
+    task.add_done_callback(_log_task_exc)
+    return task
+
+# ─────────────────────────────────────────────
 #  STARTUP / SHUTDOWN
 # ─────────────────────────────────────────────
 async def on_startup():
-    await init_async_state()       # BUG FIX 2: must be first
-    await init_sqlite_spillover()
-    await load_persistent_metrics()
+    global state, proxy_pool, circuit, redis_client, sqlite_store
+
+    # Instantiate singletons
+    state        = BotState()
+    proxy_pool   = ProxyPool(PROXIES)
+    circuit      = CircuitBreaker(DOMAINS)
+    redis_client = RedisClient()
+    sqlite_store = SQLiteStore(SQLITE_DB_PATH)
+
+    # Init async primitives — all in running loop
+    await state.async_init()
+    await proxy_pool.async_init()
+    await sqlite_store.async_init()
+
+    # Load persisted data
+    metrics = await sqlite_store.load_metrics()
+    if metrics:
+        state.metrics.update(metrics.get("metrics", {}))
+        state.user_daily_quota.update(metrics.get("user_daily_quota", {}))
+        state.user_dl_counts.update(metrics.get("user_dl_counts", {}))
+
+    # Connect external services
     await init_session()
-    await init_redis()
+    await redis_client.connect(REDIS_URL)
     await init_mongo()
-    load_local_queue()
-    log.info("bot_startup_complete", node=NODE_ID)
+    await restore_queue_async()
+
+    log.info("startup_complete", node=NODE_ID, proxies=proxy_pool.stats())
 
 async def on_shutdown():
-    dump_local_queue()
-    await save_persistent_metrics()
+    dump_queue_sync()
+    await sqlite_store.save_metrics({
+        "metrics":          state.metrics,
+        "user_daily_quota": state.user_daily_quota,
+        "user_dl_counts":   state.user_dl_counts,
+    })
     await close_session()
-    await close_redis()
-    log.info("bot_shutdown_complete", node=NODE_ID)
+    await redis_client.close()
+    log.info("shutdown_complete", node=NODE_ID)
 
 # ─────────────────────────────────────────────
-#  MAIN ENTRY POINT
+#  MAIN
 # ─────────────────────────────────────────────
 async def main():
     await on_startup()
     try:
         await app.start()
-        log.info("pyrogram_bot_started")
-        await asyncio.Event().wait()   # run forever
+        log.info("bot_running")
+        await asyncio.Event().wait()
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
