@@ -248,6 +248,7 @@ async def sqlite_load(sid: str) -> Optional[bytes]:
 # ─────────────────────────────────────────────
 #  PYROGRAM CLIENT
 # ─────────────────────────────────────────────
+print("IMPORT LOOP:", id(asyncio.get_event_loop()))
 app = Client(
     "pharma_ultimate_v2",
     api_id=API_ID,
@@ -1289,6 +1290,12 @@ async def cmd_search(client, msg: Message):
     )
 
 # ─────────────────────────────────────────────
+@app.on_message(filters.private, group=-999)
+
+async def debug_all(_, msg):
+
+    print("DEBUG MSG:", repr(msg.text))
+
 #  CALLBACK ROUTER
 # ─────────────────────────────────────────────
 @app.on_callback_query()
@@ -1554,7 +1561,10 @@ async def main():
         print("❌ Missing API_ID / API_HASH / BOT_TOKEN in .env")
         sys.exit(1)
 
-    await start_services()
+    print("LOOP MAIN:", id(asyncio.get_running_loop()))
+    print("LOOP APP :", id(app.loop))
+    print("LOOP DSP :", id(app.dispatcher.loop))
+    # await start_services()
     print("🚀 Pharma Ultimate Bot v4.0 Scale-Ready Engine starting…")
     try:
         await app.start()
@@ -1572,4 +1582,4 @@ async def main():
         print("👋 Stopped cleanly.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app.loop.run_until_complete(main())
